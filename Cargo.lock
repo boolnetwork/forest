@@ -3834,7 +3834,6 @@ dependencies = [
  "anyhow",
  "bls-signatures",
  "cid",
- "filecoin-proofs-api",
  "fvm 2.4.0",
  "fvm 3.4.0",
  "fvm_ipld_blockstore",

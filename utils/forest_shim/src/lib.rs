@@ -12,7 +12,7 @@ pub mod gas;
 pub mod machine;
 pub mod message;
 pub mod randomness;
-pub mod sector;
+// pub mod sector;
 pub mod state_tree;
 pub mod version;
 
