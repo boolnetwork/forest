@@ -10,6 +10,8 @@ pub use self::network::Network;
 pub use self::payload::{BLSPublicKey, Payload};
 pub use self::protocol::Protocol;
 
+pub type ActorID = u64;
+
 use data_encoding::Encoding;
 #[allow(unused_imports)]
 use data_encoding_macro::{internal_new_encoding, new_encoding};
@@ -18,6 +20,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::hash::Hash;
 use std::str::FromStr;
+use crate::payload::DelegatedAddress;
 
 /// defines the encoder for base32 encoding with the provided string with no padding
 const ADDRESS_ENCODER: Encoding = new_encoding! {
@@ -37,7 +40,11 @@ pub const BLS_PUB_LEN: usize = 48;
 /// Length of the checksum hash for string encodings.
 pub const CHECKSUM_HASH_LEN: usize = 4;
 
+/// Max length of f4 sub addresses.
+pub const MAX_SUBADDRESS_LEN: usize = 54;
+
 const MAX_ADDRESS_LEN: usize = 84 + 2;
+const MAX_ADDRRESS_TEXT_LEN: usize = 138;
 const MAINNET_PREFIX: &str = "f";
 const TESTNET_PREFIX: &str = "t";
 
@@ -170,10 +177,9 @@ impl fmt::Display for Address {
 impl FromStr for Address {
     type Err = Error;
     fn from_str(addr: &str) -> Result<Self, Error> {
-        if addr.len() > MAX_ADDRESS_LEN || addr.len() < 3 {
+        if addr.len() > MAX_ADDRRESS_TEXT_LEN || addr.len() < 3 {
             return Err(Error::InvalidLength);
         }
-        // ensure the network character is valid before converting
         let network: Network = match addr.get(0..1).ok_or(Error::UnknownNetwork)? {
             TESTNET_PREFIX => Network::Testnet,
             MAINNET_PREFIX => Network::Mainnet,
@@ -188,50 +194,93 @@ impl FromStr for Address {
             "1" => Protocol::Secp256k1,
             "2" => Protocol::Actor,
             "3" => Protocol::BLS,
+            "4" => Protocol::Delegated,
             _ => {
                 return Err(Error::UnknownProtocol);
             }
         };
 
-        // bytes after the protocol character is the data payload of the address
-        let raw = addr.get(2..).ok_or(Error::InvalidPayload)?;
-        if protocol == Protocol::ID {
-            if raw.len() > 20 {
-                // 20 is max u64 as string
+        fn validate_and_split_checksum<'a>(
+            protocol: Protocol,
+            prefix: Option<&[u8]>,
+            payload: &'a [u8],
+        ) -> Result<&'a [u8], Error> {
+            if payload.len() < CHECKSUM_HASH_LEN {
                 return Err(Error::InvalidLength);
             }
-            let id = raw.parse::<u64>()?;
-            return Ok(Address {
-                network,
-                payload: Payload::ID(id),
-            });
+            let (payload, csum) = payload.split_at(payload.len() - CHECKSUM_HASH_LEN);
+            let mut hasher = blake2b_simd::Params::new()
+                .hash_length(CHECKSUM_HASH_LEN)
+                .to_state();
+            hasher.update(&[protocol as u8]);
+            if let Some(prefix) = prefix {
+                hasher.update(prefix);
+            }
+            hasher.update(payload);
+            if hasher.finalize().as_bytes() != csum {
+                return Err(Error::InvalidChecksum);
+            }
+            Ok(payload)
         }
 
-        // decode using byte32 encoding
-        let mut payload = ADDRESS_ENCODER.decode(raw.as_bytes())?;
-        // payload includes checksum at end, so split after decoding
-        let cksm = payload.split_off(payload.len() - CHECKSUM_HASH_LEN);
+        // bytes after the protocol character is the data payload of the address
+        let raw = addr.get(2..).ok_or(Error::InvalidPayload)?;
+        let addr = match protocol {
+            Protocol::ID => {
+                if raw.len() > 20 {
+                    // 20 is max u64 as string
+                    return Err(Error::InvalidLength);
+                }
+                let id = raw.parse::<u64>()?;
+                Address {
+                    network,
+                    payload: Payload::ID(id),
+                }
+            }
+            Protocol::Delegated => {
+                let (id, subaddr) = raw.split_once('f').ok_or(Error::InvalidPayload)?;
+                if id.len() > 20 {
+                    // 20 is max u64 as string
+                    return Err(Error::InvalidLength);
+                }
+                let id = id.parse::<u64>()?;
+                // decode subaddr
+                let subaddr_csum = ADDRESS_ENCODER.decode(subaddr.as_bytes())?;
+                // validate and split subaddr.
+                let subaddr = validate_and_split_checksum(
+                    protocol,
+                    Some(unsigned_varint::encode::u64(
+                        id,
+                        &mut unsigned_varint::encode::u64_buffer(),
+                    )),
+                    &subaddr_csum,
+                )?;
 
-        // sanity check to make sure address hash values are correct length
-        if (protocol == Protocol::Secp256k1 || protocol == Protocol::Actor)
-            && payload.len() != PAYLOAD_HASH_LEN
-        {
-            return Err(Error::InvalidPayload);
-        }
+                Address {
+                    network,
+                    payload: Payload::Delegated(DelegatedAddress::new(id, subaddr)?),
+                }
+            }
+            Protocol::Secp256k1 | Protocol::Actor | Protocol::BLS => {
+                // decode using byte32 encoding
+                let payload_csum = ADDRESS_ENCODER.decode(raw.as_bytes())?;
+                // validate and split payload.
+                let payload = validate_and_split_checksum(protocol, None, &payload_csum)?;
 
-        // sanity check to make sure bls pub key is correct length
-        if protocol == Protocol::BLS && payload.len() != BLS_PUB_LEN {
-            return Err(Error::InvalidPayload);
-        }
+                // sanity check to make sure address hash values are correct length
+                if match protocol {
+                    Protocol::Secp256k1 | Protocol::Actor => PAYLOAD_HASH_LEN,
+                    Protocol::BLS => BLS_PUB_LEN,
+                    _ => unreachable!(),
+                } != payload.len()
+                {
+                    return Err(Error::InvalidPayload);
+                }
 
-        // validate checksum
-        let mut ingest = payload.clone();
-        ingest.insert(0, protocol as u8);
-        if !validate_checksum(&ingest, cksm) {
-            return Err(Error::InvalidChecksum);
-        }
-
-        Address::new(network, protocol, &payload)
+                Address::new( network, protocol, payload)?
+            }
+        };
+        Ok(addr)
     }
 }
 
@@ -281,6 +330,38 @@ fn encode(addr: &Address) -> String {
             addr.protocol().to_string(),
             from_leb_bytes(&addr.payload_bytes()).expect("should read encoded bytes"),
         ),
+        Protocol::Delegated => {
+            let protocol = addr.protocol();
+            let network = addr.network();
+
+            let addr = if let Payload::Delegated(addr) = addr.payload() { addr } else { todo!() };
+
+            let mut hasher = blake2b_simd::Params::new()
+                .hash_length(CHECKSUM_HASH_LEN)
+                .to_state();
+            hasher.update(&[protocol as u8]);
+
+            let mut buf = unsigned_varint::encode::u64_buffer();
+            let prefix = unsigned_varint::encode::u64(
+                addr.namespace(),
+                &mut buf,
+            );
+
+            hasher.update(prefix);
+            hasher.update(addr.subaddress());
+
+            let mut buf = Vec::with_capacity(addr.subaddress().len() + CHECKSUM_HASH_LEN);
+            buf.extend(addr.subaddress());
+            buf.extend(hasher.finalize().as_bytes());
+
+            format!(
+                "{}{}{}f{}",
+                network.to_prefix(),
+                protocol.to_string(),
+                addr.namespace(),
+                ADDRESS_ENCODER.encode(&buf),
+            )
+        }
     }
 }
 
@@ -295,10 +376,12 @@ pub(crate) fn to_leb_bytes(id: u64) -> Result<Vec<u8>, Error> {
 }
 
 pub(crate) fn from_leb_bytes(bz: &[u8]) -> Result<u64, Error> {
-    let mut readable = &bz[..];
-
     // write id to buffer in leb128 format
-    Ok(leb128::read::unsigned(&mut readable)?)
+    let (id, remaining) = unsigned_varint::decode::u64(bz)?;
+    if !remaining.is_empty() {
+        return Err(Error::InvalidPayload);
+    }
+    Ok(id)
 }
 
 /// Checksum calculates the 4 byte checksum hash

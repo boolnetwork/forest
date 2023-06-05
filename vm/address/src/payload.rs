@@ -1,7 +1,7 @@
 // Copyright 2020 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use super::{from_leb_bytes, to_leb_bytes, Error, Protocol, BLS_PUB_LEN, PAYLOAD_HASH_LEN};
+use super::{from_leb_bytes, to_leb_bytes, Error, Protocol, BLS_PUB_LEN, PAYLOAD_HASH_LEN, MAX_SUBADDRESS_LEN, ActorID};
 use std::convert::TryInto;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -46,6 +46,63 @@ impl Deref for BLSPublicKey {
     }
 }
 
+/// A "delegated" (f4) address.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DelegatedAddress {
+    namespace: ActorID,
+    length: usize,
+    buffer: [u8; MAX_SUBADDRESS_LEN],
+}
+
+// impl quickcheck::Arbitrary for DelegatedAddress {
+//     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+//         Self {
+//             namespace: ActorID::arbitrary(g),
+//             length: usize::arbitrary(g) % (MAX_SUBADDRESS_LEN + 1),
+//             buffer: from_fn(|_| u8::arbitrary(g)),
+//         }
+//     }
+// }
+//
+// impl<'a> arbitrary::Arbitrary<'a> for DelegatedAddress {
+//     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+//         Ok(DelegatedAddress {
+//             namespace: arbitrary::Arbitrary::arbitrary(u)?,
+//             length: u.int_in_range(0usize..=MAX_SUBADDRESS_LEN)?,
+//             buffer: arbitrary::Arbitrary::arbitrary(u)?,
+//         })
+//     }
+// }
+
+impl DelegatedAddress {
+    /// Construct a new delegated address from the namespace (actor id) and subaddress.
+    pub fn new(namespace: ActorID, subaddress: &[u8]) -> Result<Self, Error> {
+        let length = subaddress.len();
+        if length > MAX_SUBADDRESS_LEN {
+            return Err(Error::InvalidPayloadLength(length));
+        }
+        let mut addr = DelegatedAddress {
+            namespace,
+            length,
+            buffer: [0u8; MAX_SUBADDRESS_LEN],
+        };
+        addr.buffer[..length].copy_from_slice(&subaddress[..length]);
+        Ok(addr)
+    }
+
+    /// Returns the delegated address's namespace .
+    #[inline]
+    pub fn namespace(&self) -> ActorID {
+        self.namespace
+    }
+
+    /// Returns the delegated address's subaddress .
+    #[inline]
+    pub fn subaddress(&self) -> &[u8] {
+        &self.buffer[..self.length]
+    }
+}
+
 /// Payload is the data of the Address. Variants are the supported Address protocols.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Payload {
@@ -57,6 +114,8 @@ pub enum Payload {
     Actor([u8; PAYLOAD_HASH_LEN]),
     /// BLS key address, full 48 byte public key
     BLS(BLSPublicKey),
+    /// f4: Delegated address, a namespace with an arbitrary subaddress.
+    Delegated(DelegatedAddress),
 }
 
 impl Payload {
@@ -68,19 +127,17 @@ impl Payload {
             Secp256k1(arr) => arr.to_vec(),
             Actor(arr) => arr.to_vec(),
             BLS(arr) => arr.to_vec(),
+            Delegated(addr) => {
+                let mut buf = to_leb_bytes(addr.namespace()).unwrap();
+                buf.extend(addr.subaddress());
+                buf
+            }
         }
     }
 
     /// Returns encoded bytes of Address including the protocol byte.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        use Payload::*;
-        let mut bz = match self {
-            ID(i) => to_leb_bytes(*i).unwrap(),
-            Secp256k1(arr) => arr.to_vec(),
-            Actor(arr) => arr.to_vec(),
-            BLS(arr) => arr.to_vec(),
-        };
-
+        let mut bz = self.to_raw_bytes();
         bz.insert(0, Protocol::from(self) as u8);
         bz
     }
@@ -106,6 +163,10 @@ impl Payload {
                 let mut pk = [0u8; BLS_PUB_LEN];
                 pk.copy_from_slice(payload);
                 Self::BLS(pk.into())
+            },
+            Protocol::Delegated => {
+                let (id, remaining) = unsigned_varint::decode::u64(payload)?;
+                Self::Delegated(DelegatedAddress::new(id, remaining)?)
             }
         };
         Ok(payload)
@@ -119,6 +180,7 @@ impl From<Payload> for Protocol {
             Payload::Secp256k1(_) => Self::Secp256k1,
             Payload::Actor(_) => Self::Actor,
             Payload::BLS(_) => Self::BLS,
+            Payload::Delegated { .. } => Self::Delegated,
         }
     }
 }
@@ -130,6 +192,7 @@ impl From<&Payload> for Protocol {
             Payload::Secp256k1(_) => Self::Secp256k1,
             Payload::Actor(_) => Self::Actor,
             Payload::BLS(_) => Self::BLS,
+            Payload::Delegated { .. } => Self::Delegated,
         }
     }
 }
